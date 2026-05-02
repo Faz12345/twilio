@@ -77,6 +77,59 @@ Response rules:
   - Do not identify yourself as an AI. Write like a real doctor.
   - No preamble."""
 
+SEVERITY_PROMPT = """You are a medical triage classifier. Given a patient's symptom description and/or a doctor's response, assess the severity of the condition.
+
+Respond ONLY with a valid JSON object — no explanation, no markdown, no preamble:
+{
+  "severity": "critical" | "moderate" | "mild",
+  "reason": "one sentence reason",
+  "keywords": ["list", "of", "key", "symptoms"]
+}
+
+Rules:
+- "critical": life-threatening conditions requiring immediate emergency response.
+  Examples: heart attack, stroke, severe chest pain, difficulty breathing, unconsciousness,
+  severe allergic reaction (anaphylaxis), uncontrolled bleeding, poisoning, overdose,
+  seizure, suspected spinal injury, severe burns, sepsis signs.
+- "moderate": serious conditions needing urgent medical attention within hours but not immediately life-threatening.
+  Examples: high fever, moderate pain, suspected fracture, persistent vomiting, infected wounds.
+- "mild": non-urgent conditions manageable with home care or a routine doctor visit.
+  Examples: common cold, minor cuts, mild headache, minor rash, low-grade fever."""
+
+
+def classify_severity(user_query: str, doctor_response: str) -> dict:
+    """
+    Use LLM to classify whether the condition is critical/moderate/mild.
+    Returns dict with keys: severity, reason, keywords
+    """
+    if not GROQ_API_KEY:
+        return {"severity": "mild", "reason": "Could not classify — no API key.", "keywords": []}
+
+    client = Groq(api_key=GROQ_API_KEY)
+    combined = f"Patient query: {user_query}\n\nDoctor assessment: {doctor_response}"
+
+    try:
+        resp = client.chat.completions.create(
+            model=MODEL,
+            messages=[
+                {"role": "system", "content": SEVERITY_PROMPT},
+                {"role": "user",   "content": combined},
+            ],
+            max_tokens=200,
+            temperature=0.1,   # low temperature for consistent classification
+        )
+        raw = resp.choices[0].message.content.strip()
+        # Strip any accidental markdown fences
+        raw = raw.replace("```json", "").replace("```", "").strip()
+        result = json.loads(raw)
+        # Validate shape
+        if result.get("severity") not in ("critical", "moderate", "mild"):
+            result["severity"] = "mild"
+        return result
+    except Exception as e:
+        logger.warning(f"Severity classification failed: {e}")
+        return {"severity": "mild", "reason": "Classification error.", "keywords": []}
+
 
 # ---------------------------------------------------------------------------
 # Agentic tool-calling loop
@@ -231,8 +284,10 @@ def analyze():
         finally:
             audio_path.unlink(missing_ok=True)
 
-    typed_text = request.form.get("text", "").strip()
-    user_query = (speech_text + " " + typed_text).strip() or "Please analyze my image."
+    typed_text        = request.form.get("text", "").strip()
+    emergency_contact = request.form.get("emergency_contact", "").strip()  # ← NEW
+    patient_name      = request.form.get("patient_name", "the patient").strip()
+    user_query        = (speech_text + " " + typed_text).strip() or "Please analyze my image."
 
     # 2. Build user content (text + optional image for multimodal)
     user_content: list[dict] = [{"type": "text", "text": user_query}]
@@ -261,7 +316,29 @@ def analyze():
         if image_path and image_path.exists():
             image_path.unlink(missing_ok=True)
 
-    # 4. TTS
+    # 4. Severity classification ← NEW
+    severity_result = classify_severity(user_query, doctor_response)
+    severity        = severity_result.get("severity", "mild")
+    logger.info(f"Severity: {severity} — {severity_result.get('reason', '')}")
+
+    # 5. Auto emergency call if CRITICAL and contact number provided ← NEW
+    emergency_result = None
+    auto_called      = False
+    if severity == "critical" and emergency_contact:
+        logger.warning(f"CRITICAL condition detected — auto-calling {emergency_contact}")
+        summary_for_call = (
+            f"Patient ({patient_name}) reported: {user_query[:200]}. "
+            f"Doctor assessment: {doctor_response[:250]}."
+        )
+        emergency_result = ec.trigger_emergency(
+            summary      = summary_for_call,
+            patient_name = patient_name,
+            to_number    = emergency_contact,
+        )
+        auto_called = emergency_result.get("success", False)
+        logger.info(f"Auto-call result: {emergency_result}")
+
+    # 6. TTS
     audio_name = f"response_{uuid.uuid4().hex}.mp3"
     audio_out  = AUDIO_DIR / audio_name
     audio_url  = None
@@ -281,11 +358,17 @@ def analyze():
         logger.warning(f"TTS failed: {e}")
 
     return jsonify({
-        "speech_text":     speech_text,
-        "doctor_response": doctor_response,
-        "audio_url":       audio_url,
-        "mcp_tools_used":  [t["tool"] for t in tool_log],
-        "tool_call_count": len(tool_log),
+        "speech_text":      speech_text,
+        "doctor_response":  doctor_response,
+        "audio_url":        audio_url,
+        "mcp_tools_used":   [t["tool"] for t in tool_log],
+        "tool_call_count":  len(tool_log),
+        # severity fields ↓
+        "severity":         severity,
+        "severity_reason":  severity_result.get("reason", ""),
+        "severity_keywords":severity_result.get("keywords", []),
+        "auto_called":      auto_called,
+        "emergency_result": emergency_result,
     })
 
 
