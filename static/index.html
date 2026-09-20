@@ -1032,6 +1032,23 @@
   .auto-call-body { font-size: 0.68rem; color: var(--text-mid); line-height: 1.5; }
   .auto-call-meta { font-size: 0.6rem; color: var(--text-dim); margin-top: 5px; }
 
+  /* ── Nearby care panel ──────────────────────────── */
+  .nearby-panel {
+    display: none; margin: 0 16px 16px; padding: 14px 16px;
+    border: 1px solid rgba(255,184,77,0.35); border-radius: 8px;
+    background: rgba(255,184,77,0.06);
+  }
+  .nearby-panel.visible { display: block; }
+  .nearby-title { color: var(--amber); font-size: 0.68rem; font-weight: 600; text-transform: uppercase; letter-spacing: 0.08em; }
+  .nearby-status { color: var(--text-mid); font-size: 0.65rem; line-height: 1.5; margin: 5px 0 9px; }
+  .nearby-btn { border: 1px solid rgba(0,210,180,0.35); color: var(--teal); background: rgba(0,210,180,0.08); border-radius: 5px; padding: 7px 10px; cursor: pointer; font: inherit; font-size: 0.62rem; }
+  .nearby-btn:disabled { opacity: 0.5; cursor: wait; }
+  .nearby-list { display: flex; flex-direction: column; gap: 6px; }
+  .nearby-item { display: flex; justify-content: space-between; gap: 8px; align-items: center; padding: 8px; background: var(--bg2); border: 1px solid var(--border); border-radius: 5px; }
+  .nearby-name { color: var(--text); font-size: 0.65rem; font-weight: 600; }
+  .nearby-meta { color: var(--text-dim); font-size: 0.58rem; margin-top: 2px; }
+  .nearby-link { color: var(--teal); font-size: 0.6rem; white-space: nowrap; }
+
   /* ── Contact fields ─────────────────────────────── */
   .contact-row {
     display: grid; grid-template-columns: 1fr 1fr; gap: 8px;
@@ -1335,6 +1352,13 @@
             <div class="auto-call-meta" id="autoCallMeta"></div>
           </div>
         </div>
+
+        <div class="nearby-panel" id="nearbyPanel">
+          <div class="nearby-title">📍 Nearby medical care</div>
+          <div class="nearby-status" id="nearbyStatus"></div>
+          <button class="nearby-btn" id="nearbyBtn" onclick="findNearbyDoctors()">Use GPS to find nearby care</button>
+          <div class="nearby-list" id="nearbyList"></div>
+        </div>
       </div>
 
     </div>
@@ -1596,6 +1620,8 @@ async function analyze() {
 
   // Hide previous auto-call banner
   document.getElementById('autoCallBanner').classList.remove('visible');
+  document.getElementById('nearbyPanel').classList.remove('visible');
+  document.getElementById('nearbyList').innerHTML = '';
 
   // Add patient message
   if (chatEmpty) {
@@ -1653,6 +1679,13 @@ async function analyze() {
         toast('⚠️ Critical condition detected — add an emergency contact number to enable auto-calling', true);
       }
 
+      // Critical cases request GPS immediately; moderate cases wait for the
+      // patient to press the button so location access is always intentional.
+      if (severity === 'critical' || severity === 'moderate') {
+        showNearbyCare(severity);
+        if (severity === 'critical') findNearbyDoctors();
+      }
+
       if (data.audio_url) {
         document.getElementById('audioPlayer').src = data.audio_url;
         document.getElementById('audioBar').classList.add('visible');
@@ -1680,6 +1713,54 @@ async function analyze() {
 
 function severityIcon(s) {
   return s === 'critical' ? '🔴' : s === 'moderate' ? '🟡' : '🟢';
+}
+
+function showNearbyCare(severity) {
+  const panel = document.getElementById('nearbyPanel');
+  const status = document.getElementById('nearbyStatus');
+  panel.classList.add('visible');
+  status.textContent = severity === 'critical'
+    ? 'Critical symptoms detected. Allow location access to locate nearby hospitals. If this is life-threatening, call local emergency services now.'
+    : 'Urgent symptoms detected. Share your location to find nearby hospitals, clinics, and doctors.';
+}
+
+async function findNearbyDoctors() {
+  const btn = document.getElementById('nearbyBtn');
+  const status = document.getElementById('nearbyStatus');
+  const list = document.getElementById('nearbyList');
+  if (!navigator.geolocation) {
+    status.textContent = 'GPS is not supported by this browser. Please use your map app to find nearby care.';
+    return;
+  }
+
+  btn.disabled = true;
+  btn.textContent = 'Getting your location…';
+  status.textContent = 'Your location is used only to search for nearby medical facilities.';
+  try {
+    const position = await new Promise((resolve, reject) => {
+      navigator.geolocation.getCurrentPosition(resolve, reject, {
+        enableHighAccuracy: true, timeout: 10000, maximumAge: 300000,
+      });
+    });
+    const { latitude, longitude } = position.coords;
+    const res = await fetch(`/api/nearby-doctors?lat=${encodeURIComponent(latitude)}&lon=${encodeURIComponent(longitude)}`);
+    const data = await res.json();
+    if (!res.ok || data.error) throw new Error(data.error || 'Nearby search failed');
+    list.innerHTML = data.facilities.length ? data.facilities.map(facility => `
+      <div class="nearby-item">
+        <div><div class="nearby-name">${escHtml(facility.name)}</div>
+        <div class="nearby-meta">${escHtml(facility.type)} · ${facility.distance_km} km${facility.address ? ` · ${escHtml(facility.address)}` : ''}</div></div>
+        <a class="nearby-link" href="${facility.directions_url}" target="_blank" rel="noopener">Directions ↗</a>
+      </div>`).join('') : '<div class="nearby-meta">No medical facilities found within 10 km. Call local emergency services for critical symptoms.</div>';
+    status.textContent = `Found ${data.facilities.length} nearby medical facility${data.facilities.length === 1 ? '' : 'ies'}.`;
+    btn.style.display = 'none';
+  } catch (err) {
+    status.textContent = err.code === 1
+      ? 'Location access was denied. Enable GPS permission or open your map app to find nearby care.'
+      : (err.message || 'Could not search nearby facilities.');
+    btn.disabled = false;
+    btn.textContent = 'Try GPS again';
+  }
 }
 
 function animateThinking() {

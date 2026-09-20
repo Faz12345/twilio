@@ -7,7 +7,7 @@ from groq import Groq
 
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
 
-model = "meta-llama/llama-4-scout-17b-16e-instruct"
+model = "qwen/qwen3.8-27b"
 
 
 def encode_image(image_path):

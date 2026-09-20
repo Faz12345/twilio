@@ -8,7 +8,6 @@ Endpoints:
   POST /api/upload-doc                → upload PDF/TXT into MCP store
   POST /api/analyze                   → audio + image + text → JSON response
   GET  /api/audio/<name>              → serve generated TTS audio
-
   POST /api/emergency/trigger         → place Twilio call + SMS to emergency contact
   GET  /api/emergency/twiml           → TwiML webhook (Twilio fetches this during the call)
   POST /api/emergency/status          → Twilio call-status callback (logs progress)
@@ -21,6 +20,9 @@ import os
 import uuid
 import json
 import logging
+import math
+import urllib.parse
+import urllib.request
 from pathlib import Path
 
 from flask import Flask, request, jsonify, send_file, send_from_directory
@@ -50,7 +52,8 @@ for d in (DOCS_DIR, AUDIO_DIR, UPLOAD_DIR):
 
 # ── Groq client ──────────────────────────────────────────────────────────────
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
-MODEL = "meta-llama/llama-4-scout-17b-16e-instruct"
+MODEL = "openai/gpt-oss-120b"
+VISION_MODEL = "qwen/qwen3.8-27b"
 
 # ── system prompt ─────────────────────────────────────────────────────────────
 SYSTEM_PROMPT = """You are acting as a professional doctor for educational purposes.
@@ -149,9 +152,17 @@ def agentic_complete(
         raise RuntimeError("GROQ_API_KEY is not set.")
 
     client = Groq(api_key=GROQ_API_KEY)
+    # Groq's text model requires message content to be a string. Use the
+    # vision-capable model when the request contains an image, which supports
+    # the OpenAI multimodal content format used by the analyze endpoint.
+    has_image = any(part.get("type") == "image_url" for part in user_content)
+    request_model = VISION_MODEL if has_image else MODEL
+    message_content = user_content if has_image else "\n".join(
+        part.get("text", "") for part in user_content if part.get("type") == "text"
+    )
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user", "content": user_content},
+        {"role": "user", "content": message_content},
     ]
     tool_calls_log: list[dict] = []
 
@@ -159,7 +170,7 @@ def agentic_complete(
         logger.info(f"MCP loop iteration {iteration + 1}")
 
         response = client.chat.completions.create(
-            model=MODEL,
+            model=request_model,
             messages=messages,
             tools=mcp.MCP_TOOLS,
             tool_choice="auto",
@@ -261,6 +272,89 @@ def upload_doc():
         return jsonify({"message": f"Ingested '{f.filename}' → {result['chunks_added']} chunks", **result})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/nearby-doctors", methods=["GET"])
+def nearby_doctors():
+    """Find nearby medical facilities using browser-provided GPS coordinates."""
+    try:
+        latitude = float(request.args.get("lat", ""))
+        longitude = float(request.args.get("lon", ""))
+        radius = min(max(int(request.args.get("radius", "10000")), 1000), 25000)
+    except (TypeError, ValueError):
+        return jsonify({"error": "Valid lat and lon coordinates are required."}), 400
+
+    if not (-90 <= latitude <= 90 and -180 <= longitude <= 180):
+        return jsonify({"error": "Coordinates are outside valid ranges."}), 400
+
+    query = f"""
+[out:json][timeout:15];
+(
+  nwr[amenity~"^(hospital|clinic|doctors)$"](around:{radius},{latitude},{longitude});
+  nwr[healthcare~"^(hospital|clinic|doctor|doctors)$"](around:{radius},{latitude},{longitude});
+);
+out center tags;
+"""
+    try:
+        encoded = urllib.parse.urlencode({"data": query}).encode("utf-8")
+        req = urllib.request.Request(
+            "https://overpass-api.de/api/interpreter",
+            data=encoded,
+            headers={"User-Agent": "MediBot/2.0 (educational medical assistant)"},
+        )
+        with urllib.request.urlopen(req, timeout=20) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except Exception as exc:
+        logger.warning("Nearby facility lookup failed: %s", exc)
+        return jsonify({"error": "Nearby facility service is temporarily unavailable."}), 502
+
+    facilities = []
+    seen = set()
+    for element in payload.get("elements", []):
+        tags = element.get("tags", {})
+        name = tags.get("name") or tags.get("official_name") or "Unnamed medical facility"
+        if element.get("type") == "node":
+            facility_lat, facility_lon = element.get("lat"), element.get("lon")
+        else:
+            center = element.get("center", {})
+            facility_lat, facility_lon = center.get("lat"), center.get("lon")
+        if facility_lat is None or facility_lon is None:
+            continue
+
+        key = (name, round(facility_lat, 5), round(facility_lon, 5))
+        if key in seen:
+            continue
+        seen.add(key)
+        distance = 6371 * 2 * math.asin(math.sqrt(
+            math.sin(math.radians(facility_lat - latitude) / 2) ** 2
+            + math.cos(math.radians(latitude))
+            * math.cos(math.radians(facility_lat))
+            * math.sin(math.radians(facility_lon - longitude) / 2) ** 2
+        ))
+        facility_type = tags.get("amenity") or tags.get("healthcare") or "medical facility"
+        facilities.append({
+            "name": name,
+            "type": facility_type,
+            "distance_km": round(distance, 1),
+            "latitude": facility_lat,
+            "longitude": facility_lon,
+            "address": ", ".join(filter(None, [
+                tags.get("addr:housenumber"), tags.get("addr:street"),
+                tags.get("addr:city"), tags.get("addr:postcode"),
+            ])),
+            "directions_url": (
+                "https://www.google.com/maps/dir/?api=1&destination="
+                f"{facility_lat},{facility_lon}"
+            ),
+        })
+
+    facilities.sort(key=lambda item: item["distance_km"])
+    return jsonify({
+        "facilities": facilities[:10],
+        "latitude": latitude,
+        "longitude": longitude,
+        "radius_km": radius / 1000,
+    })
 
 
 @app.route("/api/analyze", methods=["POST"])
